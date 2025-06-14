@@ -15,8 +15,47 @@ import {IEulerTreasuryConnector} from "./interfaces/IEulerTreasuryConnector.sol"
 import {ITreasury} from "./interfaces/ITreasury.sol";
 import {IAddressesWhitelist} from "./interfaces/IAddressesWhitelist.sol";
 import {ISimpleToken} from "./interfaces/ISimpleToken.sol";
-import {IChainlinkOracle} from "./interfaces/oracles/IChainlinkOracle.sol";
 import {IEscrow} from "./interfaces/IEscrow.sol";
+
+// Import the new redemption extension interface
+interface IUSDXRedemptionExtension {
+    struct VaultInfo {
+        address vault;
+        address connector;
+        uint256 allocation;
+        bool isActive;
+        string protocol;
+    }
+    
+    function computeRedemption(
+        address _asset,
+        uint256 _usdxAmount
+    ) external view returns (uint256 assetAmount, uint256 priceAdjustment);
+    
+    function validateRedemption(
+        address _user,
+        address _asset,
+        uint256 _usdxAmount,
+        uint256 _minAssetAmount,
+        uint256 _blockNumber
+    ) external view returns (bool isValid, string memory reason);
+    
+    function calculateWithdrawalPlan(
+        uint256 _requiredAmount
+    ) external view returns (VaultInfo[] memory withdrawalPlan, uint256 totalAvailable);
+    
+    function updateBlockRedemptions(uint256 _blockNumber, uint256 _amount) external;
+    
+    function getRedemptionQuote(
+        address _asset,
+        uint256 _usdxAmount
+    ) external view returns (
+        uint256 assetAmount,
+        uint256 priceAdjustment,
+        bool isPriceAdjusted,
+        string memory priceSource
+    );
+}
 
 contract Treasury is ITreasury, AccessControlDefaultAdminRulesUpgradeable, PausableUpgradeable, ReentrancyGuardUpgradeable {
 
@@ -29,8 +68,6 @@ contract Treasury is ITreasury, AccessControlDefaultAdminRulesUpgradeable, Pausa
 
     uint256 public constant USDC_DECIMALS = 6;
     uint256 public constant USDX_DECIMALS = 18;
-    uint256 public constant PRICE_SCALE = 1e18;
-    uint256 public constant HEARTBEAT_INTERVAL = 86400; // 24 hours
 
     address public immutable USDX_ADDRESS;
     address public immutable USDC_ADDRESS;
@@ -39,33 +76,21 @@ contract Treasury is ITreasury, AccessControlDefaultAdminRulesUpgradeable, Pausa
     IAaveTreasuryConnector public aaveTreasuryConnector;
     ISiloTreasuryConnector public siloTreasuryConnector;
     IEulerTreasuryConnector public eulerTreasuryConnector;
-    IChainlinkOracle public chainlinkOracle;
     IEscrow public escrow;
+
+    // NEW: Redemption extension integration
+    IUSDXRedemptionExtension public usdxRedemptionExtension;
 
     IAddressesWhitelist public recipientWhitelist;
     bool public isRecipientWhitelistEnabled;
     IAddressesWhitelist public spenderWhitelist;
     bool public isSpenderWhitelistEnabled;
 
-    // Redemption state
+    // Redemption state (cooldown and escrow management remains in Treasury)
     mapping(address user => mapping(address asset => uint256 amount)) public pendingRedemptions;
     mapping(address user => mapping(address asset => uint256 timestamp)) public userCooldowns;
-    mapping(uint256 blockNumber => uint256 amount) public redeemedPerBlock;
-    mapping(address asset => bool isRedeemable) public redeemableAssets;
     
     uint256 public cooldownDuration;
-    uint256 public maxRedeemPerBlock;
-
-    // Vault configurations for withdrawal prioritization
-    struct VaultConfig {
-        address vault;
-        address connector;
-        uint256 allocation;
-        bool isActive;
-    }
-    
-    VaultConfig[] public siloVaults;
-    VaultConfig[] public eulerVaults;
 
     mapping(OperationType operation => mapping(bytes32 idempotencyKey => bool exist)) public operationRegistry;
     mapping(OperationType operation => uint256 limit) public operationLimits;
@@ -105,10 +130,9 @@ contract Treasury is ITreasury, AccessControlDefaultAdminRulesUpgradeable, Pausa
         address _eulerTreasuryConnector,
         address _recipientWhitelist,
         address _spenderWhitelist,
-        address _chainlinkOracle,
         address _escrow,
-        uint256 _cooldownDuration,
-        uint256 _maxRedeemPerBlock
+        address _usdxRedemptionExtension,
+        uint256 _cooldownDuration
     ) public initializer {
         __AccessControlDefaultAdminRules_init(1 days, msg.sender);
         __Pausable_init();
@@ -142,9 +166,9 @@ contract Treasury is ITreasury, AccessControlDefaultAdminRulesUpgradeable, Pausa
         _assertNonZero(_eulerTreasuryConnector);
         eulerTreasuryConnector = IEulerTreasuryConnector(_eulerTreasuryConnector);
 
-        // Initialize oracle and escrow
-        chainlinkOracle = IChainlinkOracle(_assertNonZero(_chainlinkOracle));
+        // Initialize escrow and redemption extension
         escrow = IEscrow(_assertNonZero(_escrow));
+        usdxRedemptionExtension = IUSDXRedemptionExtension(_assertNonZero(_usdxRedemptionExtension));
 
         // Initialize whitelists
         _assertNonZero(_recipientWhitelist);
@@ -157,10 +181,6 @@ contract Treasury is ITreasury, AccessControlDefaultAdminRulesUpgradeable, Pausa
 
         // Initialize redemption parameters
         cooldownDuration = _cooldownDuration;
-        maxRedeemPerBlock = _maxRedeemPerBlock;
-        
-        // USDC is redeemable by default
-        redeemableAssets[USDC_ADDRESS] = true;
     }
 
     receive() external payable {
@@ -168,11 +188,12 @@ contract Treasury is ITreasury, AccessControlDefaultAdminRulesUpgradeable, Pausa
     }
 
     // =============================================================================
-    // REDEMPTION SYSTEM
+    // REDEMPTION SYSTEM (Updated to use USDXRedemptionExtension)
     // =============================================================================
 
     /**
      * @dev Initiates redemption of USDX for USDC with cooldown period
+     * Uses USDXRedemptionExtension for calculation and validation
      * @param _usdxAmount Amount of USDX to redeem
      * @param _minUsdcAmount Minimum USDC amount expected
      * @return usdxAmount The USDX amount burned
@@ -186,31 +207,37 @@ contract Treasury is ITreasury, AccessControlDefaultAdminRulesUpgradeable, Pausa
         nonReentrant 
         returns (uint256 usdxAmount, uint256 usdcAmount) 
     {
-        if (!redeemableAssets[USDC_ADDRESS]) revert UnsupportedAsset();
         if (_usdxAmount == 0) revert InvalidAmount(_usdxAmount);
 
-        // Calculate USDC amount using price adjustment
-        usdcAmount = computeRedemption(USDC_ADDRESS, _usdxAmount);
+        // Validate redemption using extension
+        (bool isValid, string memory reason) = usdxRedemptionExtension.validateRedemption(
+            msg.sender,
+            USDC_ADDRESS,
+            _usdxAmount,
+            _minUsdcAmount,
+            block.number
+        );
+        if (!isValid) revert RedemptionValidationFailed(reason);
+
+        // Calculate USDC amount using extension
+        (usdcAmount,) = usdxRedemptionExtension.computeRedemption(USDC_ADDRESS, _usdxAmount);
         if (usdcAmount < _minUsdcAmount) revert MinimumCollateralAmountNotMet();
 
-        // Track pending redemption and start cooldown
+        // Track pending redemption and start cooldown (Treasury responsibility)
         pendingRedemptions[msg.sender][USDC_ADDRESS] += usdcAmount;
         userCooldowns[msg.sender][USDC_ADDRESS] = block.timestamp;
-        redeemedPerBlock[block.number] += _usdxAmount;
 
-        // Check block limits
-        if (redeemedPerBlock[block.number] > maxRedeemPerBlock) {
-            revert ExceedsMaxBlockLimit();
-        }
+        // Update block redemption tracking in extension
+        usdxRedemptionExtension.updateBlockRedemptions(block.number, _usdxAmount);
 
         // Burn USDX immediately
         ISimpleToken(USDX_ADDRESS).burn(msg.sender, _usdxAmount);
 
-        // Ensure enough USDC is available
+        // Ensure enough USDC is available using extension's withdrawal plan
         uint256 availableUsdc = IERC20(USDC_ADDRESS).balanceOf(address(this));
         if (availableUsdc < usdcAmount) {
             uint256 toWithdraw = usdcAmount - availableUsdc;
-            _withdrawFromProtocols(toWithdraw);
+            _withdrawFromProtocolsUsingPlan(toWithdraw);
         }
 
         // Move USDC to escrow during cooldown
@@ -255,7 +282,7 @@ contract Treasury is ITreasury, AccessControlDefaultAdminRulesUpgradeable, Pausa
     }
 
     /**
-     * @dev Computes USDC amount for USDX redemption with price adjustment
+     * @dev Computes USDC amount for USDX redemption (delegates to extension)
      * @param _asset The asset to redeem (USDC)
      * @param _usdxAmount Amount of USDX to redeem
      * @return usdcAmount Amount of USDC to receive
@@ -264,95 +291,49 @@ contract Treasury is ITreasury, AccessControlDefaultAdminRulesUpgradeable, Pausa
         address _asset,
         uint256 _usdxAmount
     ) public view returns (uint256 usdcAmount) {
-        if (_asset != USDC_ADDRESS) revert UnsupportedAsset();
-
-        try chainlinkOracle.getLatestRoundData(USDC_ADDRESS) returns (
-            uint80, int256 price, uint256, uint256 updatedAt, uint80
-        ) {
-            // Check if price data is recent
-            if (block.timestamp - updatedAt > HEARTBEAT_INTERVAL) {
-                // Use 1:1 conversion if stale data
-                return _convertUsdxToUsdc(_usdxAmount);
-            }
-
-            uint8 priceDecimals = chainlinkOracle.priceDecimals(USDC_ADDRESS);
-            uint256 priceScale = 10 ** priceDecimals;
-
-            // If USDC is trading above $1, give less USDC to maintain collateralization
-            if (uint256(price) > priceScale) {
-                uint256 adjustedUsdxAmount = _usdxAmount.mulDiv(priceScale, uint256(price));
-                return _convertUsdxToUsdc(adjustedUsdxAmount);
-            } else {
-                // 1:1 conversion (1 USDX = 1 USDC)
-                return _convertUsdxToUsdc(_usdxAmount);
-            }
-        } catch {
-            // Fallback to 1:1 conversion if oracle fails
-            return _convertUsdxToUsdc(_usdxAmount);
-        }
+        (usdcAmount,) = usdxRedemptionExtension.computeRedemption(_asset, _usdxAmount);
     }
 
     /**
-     * @dev Withdraws USDC from lending protocols to fulfill redemption
+     * @dev Withdraws USDC from protocols using extension's optimal plan
      * @param _amount Amount of USDC needed
      */
-    function _withdrawFromProtocols(uint256 _amount) internal {
+    function _withdrawFromProtocolsUsingPlan(uint256 _amount) internal {
+        (IUSDXRedemptionExtension.VaultInfo[] memory plan,) = 
+            usdxRedemptionExtension.calculateWithdrawalPlan(_amount);
+
         uint256 remaining = _amount;
 
-        // Try withdrawing from Silo vaults first (60% allocation)
-        for (uint256 i = 0; i < siloVaults.length && remaining > 0; i++) {
-            if (!siloVaults[i].isActive) continue;
-            
-            uint256 vaultBalance = siloTreasuryConnector.getVaultBalance(siloVaults[i].vault);
-            if (vaultBalance == 0) continue;
+        for (uint256 i = 0; i < plan.length && remaining > 0; i++) {
+            IUSDXRedemptionExtension.VaultInfo memory vaultInfo = plan[i];
 
-            uint256 maxWithdraw = siloTreasuryConnector.previewWithdraw(siloVaults[i].vault, remaining);
-            
-            if (maxWithdraw > 0) {
-                uint256 toWithdraw = remaining > maxWithdraw ? maxWithdraw : remaining;
-                siloTreasuryConnector.withdraw(USDC_ADDRESS, siloVaults[i].vault, toWithdraw);
-                remaining -= toWithdraw;
-            }
-        }
-
-        // Then try Euler vaults (40% allocation)
-        for (uint256 i = 0; i < eulerVaults.length && remaining > 0; i++) {
-            if (!eulerVaults[i].isActive) continue;
-            
-            uint256 vaultBalance = eulerTreasuryConnector.getVaultBalance(eulerVaults[i].vault);
-            if (vaultBalance == 0) continue;
-
-            uint256 maxWithdraw = eulerTreasuryConnector.previewWithdraw(eulerVaults[i].vault, remaining);
-            
-            if (maxWithdraw > 0) {
-                uint256 toWithdraw = remaining > maxWithdraw ? maxWithdraw : remaining;
-                eulerTreasuryConnector.withdraw(USDC_ADDRESS, eulerVaults[i].vault, toWithdraw);
-                remaining -= toWithdraw;
-            }
-        }
-
-        // Finally try Aave if still need more
-        if (remaining > 0) {
-            uint256 aaveBalance = aaveTreasuryConnector.getATokenBalance(USDC_ADDRESS);
-            if (aaveBalance > 0) {
-                uint256 toWithdraw = remaining > aaveBalance ? aaveBalance : remaining;
-                aaveTreasuryConnector.withdraw(USDC_ADDRESS, toWithdraw);
-                remaining -= toWithdraw;
+            if (keccak256(bytes(vaultInfo.protocol)) == keccak256(bytes("Silo"))) {
+                uint256 maxWithdraw = siloTreasuryConnector.previewWithdraw(vaultInfo.vault, remaining);
+                if (maxWithdraw > 0) {
+                    uint256 toWithdraw = remaining > maxWithdraw ? maxWithdraw : remaining;
+                    siloTreasuryConnector.withdraw(USDC_ADDRESS, vaultInfo.vault, toWithdraw);
+                    remaining -= toWithdraw;
+                }
+            } else if (keccak256(bytes(vaultInfo.protocol)) == keccak256(bytes("Euler"))) {
+                uint256 maxWithdraw = eulerTreasuryConnector.previewWithdraw(vaultInfo.vault, remaining);
+                if (maxWithdraw > 0) {
+                    uint256 toWithdraw = remaining > maxWithdraw ? maxWithdraw : remaining;
+                    eulerTreasuryConnector.withdraw(USDC_ADDRESS, vaultInfo.vault, toWithdraw);
+                    remaining -= toWithdraw;
+                }
+            } else if (keccak256(bytes(vaultInfo.protocol)) == keccak256(bytes("Aave"))) {
+                uint256 aaveBalance = aaveTreasuryConnector.getATokenBalance(USDC_ADDRESS);
+                if (aaveBalance > 0) {
+                    uint256 toWithdraw = remaining > aaveBalance ? aaveBalance : remaining;
+                    aaveTreasuryConnector.withdraw(USDC_ADDRESS, toWithdraw);
+                    remaining -= toWithdraw;
+                }
             }
         }
 
         if (remaining > 0) {
             revert InsufficientLiquidity();
         }
-    }
-
-    /**
-     * @dev Converts USDX amount to USDC amount accounting for decimals
-     * @param _usdxAmount Amount in USDX (18 decimals)
-     * @return usdcAmount Amount in USDC (6 decimals)
-     */
-    function _convertUsdxToUsdc(uint256 _usdxAmount) internal pure returns (uint256 usdcAmount) {
-        return _usdxAmount / (10 ** (USDX_DECIMALS - USDC_DECIMALS));
     }
 
     // =============================================================================
@@ -762,87 +743,19 @@ contract Treasury is ITreasury, AccessControlDefaultAdminRulesUpgradeable, Pausa
         emit CooldownDurationSet(_cooldownDuration);
     }
 
-    function setMaxRedeemPerBlock(uint256 _maxRedeemPerBlock) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        maxRedeemPerBlock = _maxRedeemPerBlock;
-        emit MaxRedeemPerBlockSet(_maxRedeemPerBlock);
-    }
-
-    function setRedeemableAsset(address _asset, bool _isRedeemable) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        redeemableAssets[_asset] = _isRedeemable;
-        emit RedeemableAssetSet(_asset, _isRedeemable);
-    }
-
-    function addSiloVault(
-        address _vault,
-        address _connector,
-        uint256 _allocation
-    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        siloVaults.push(VaultConfig({
-            vault: _vault,
-            connector: _connector,
-            allocation: _allocation,
-            isActive: true
-        }));
-        emit VaultAdded(_vault, _connector, _allocation, "Silo");
-    }
-
-    function addEulerVault(
-        address _vault,
-        address _connector,
-        uint256 _allocation
-    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        eulerVaults.push(VaultConfig({
-            vault: _vault,
-            connector: _connector,
-            allocation: _allocation,
-            isActive: true
-        }));
-        emit VaultAdded(_vault, _connector, _allocation, "Euler");
-    }
-
-    function setSiloVaultStatus(uint256 _index, bool _isActive) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (_index >= siloVaults.length) revert InvalidVaultIndex();
-        siloVaults[_index].isActive = _isActive;
-        emit VaultStatusSet(siloVaults[_index].vault, _isActive);
-    }
-
-    function setEulerVaultStatus(uint256 _index, bool _isActive) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (_index >= eulerVaults.length) revert InvalidVaultIndex();
-        eulerVaults[_index].isActive = _isActive;
-        emit VaultStatusSet(eulerVaults[_index].vault, _isActive);
-    }
-
-    function setChainlinkOracle(address _chainlinkOracle) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        chainlinkOracle = IChainlinkOracle(_assertNonZero(_chainlinkOracle));
-        emit ChainlinkOracleSet(_chainlinkOracle);
-    }
-
     function setEscrow(address _escrow) external onlyRole(DEFAULT_ADMIN_ROLE) {
         escrow = IEscrow(_assertNonZero(_escrow));
         emit EscrowSet(_escrow);
     }
 
+    function setUSDXRedemptionExtension(address _usdxRedemptionExtension) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        usdxRedemptionExtension = IUSDXRedemptionExtension(_assertNonZero(_usdxRedemptionExtension));
+        emit USDXRedemptionExtensionSet(_usdxRedemptionExtension);
+    }
+
     // =============================================================================
     // VIEW FUNCTIONS
     // =============================================================================
-
-    function getSiloVaultsCount() external view returns (uint256) {
-        return siloVaults.length;
-    }
-
-    function getEulerVaultsCount() external view returns (uint256) {
-        return eulerVaults.length;
-    }
-
-    function getSiloVault(uint256 _index) external view returns (VaultConfig memory) {
-        if (_index >= siloVaults.length) revert InvalidVaultIndex();
-        return siloVaults[_index];
-    }
-
-    function getEulerVault(uint256 _index) external view returns (VaultConfig memory) {
-        if (_index >= eulerVaults.length) revert InvalidVaultIndex();
-        return eulerVaults[_index];
-    }
 
     function getUserRedemptionInfo(address _user) external view returns (
         uint256 pendingAmount,
@@ -856,8 +769,16 @@ contract Treasury is ITreasury, AccessControlDefaultAdminRulesUpgradeable, Pausa
         canComplete = pendingAmount > 0 && block.timestamp >= cooldownEnd;
     }
 
-    function getBlockRedemptionInfo(uint256 _blockNumber) external view returns (uint256 redeemedAmount) {
-        return redeemedPerBlock[_blockNumber];
+    function getRedemptionQuote(
+        address _asset,
+        uint256 _usdxAmount
+    ) external view returns (
+        uint256 assetAmount,
+        uint256 priceAdjustment,
+        bool isPriceAdjusted,
+        string memory priceSource
+    ) {
+        return usdxRedemptionExtension.getRedemptionQuote(_asset, _usdxAmount);
     }
 
     // =============================================================================
@@ -880,4 +801,17 @@ contract Treasury is ITreasury, AccessControlDefaultAdminRulesUpgradeable, Pausa
     function _assertNonZero(uint256 _amount) internal pure {
         if (_amount == 0) revert InvalidAmount(_amount);
     }
+
+    // =============================================================================
+    // EVENTS (Additional for redemption extension integration)
+    // =============================================================================
+
+    event USDXRedemptionExtensionSet(address indexed usdxRedemptionExtension);
+    event EscrowSet(address indexed escrow);
+
+    // =============================================================================
+    // ERRORS (Additional for redemption extension integration)
+    // =============================================================================
+
+    error RedemptionValidationFailed(string reason);
 }
