@@ -16,22 +16,34 @@ interface ITreasury is IDefaultErrors {
     event SpenderWhitelistSet(address indexed spenderWhitelist);
     event RecipientWhitelistEnabledSet(bool isEnabled);
     event SpenderWhitelistEnabledSet(bool isEnabled);
-    event LidoDeposited(bytes32 indexed _idempotencyKey, uint256 _amount, uint256 _wstETHAmount);
-    event LidoWithdrawalsRequested(bytes32 indexed _idempotencyKey, uint256[] _requestIds, uint256[] _amounts, uint256 _totalAmount);
-    event LidoWithdrawalsClaimed(bytes32 indexed _idempotencyKey, uint256[] _requestIds);
-    event LidoTreasuryConnectorSet(address indexed _lidoTreasuryConnector);
-    event LidoReferralCodeSet(address indexed _lidoReferralCode);
+    
+    // AAVE Events
     event AaveSupplied(bytes32 indexed _idempotencyKey, address indexed _token, uint256 _amount);
     event AaveBorrowed(bytes32 indexed _idempotencyKey, address indexed _token, uint256 _amount, uint256 _rateMode);
     event AaveRepaid(bytes32 indexed _idempotencyKey, address indexed _token, uint256 _amount, uint256 _rateMode);
     event AaveWithdrawn(bytes32 indexed _idempotencyKey, address indexed _token, uint256 _amount);
     event AaveReferralCodeSet(uint16 _aaveReferralCode);
     event AaveTreasuryConnectorSet(address indexed _aaveTreasuryConnector);
-    event DineroDeposited(bytes32 indexed _idempotencyKey, uint256 _amount, uint256 _pxETHPostFeeAmount, uint256 _feeAmount, uint256 _apxETHAmount);
-    event DineroInitiatedRedemption(bytes32 indexed _idempotencyKey, uint256 _apxETHAmount, uint256 _pxETHPostFeeAmount, uint256 _feeAmount);
-    event DineroInstantRedeemed(bytes32 indexed _idempotencyKey, uint256 _apxETHAmount, uint256 _pxETHPostFeeAmount, uint256 _feeAmount);
-    event DineroRedeemed(bytes32 indexed _idempotencyKey, uint256[] _upxETHTokenIds);
-    event DineroTreasuryConnectorSet(address indexed _dineroTreasuryConnector);
+    
+    // SILO Events
+    event SiloDeposited(bytes32 indexed _idempotencyKey, address indexed _asset, address indexed _siloVault, uint256 _amount, uint256 _shares);
+    event SiloWithdrawn(bytes32 indexed _idempotencyKey, address indexed _asset, address indexed _siloVault, uint256 _amount, uint256 _withdrawn);
+    event SiloTreasuryConnectorSet(address indexed _siloTreasuryConnector);
+    
+    // EULER Events
+    event EulerDeposited(bytes32 indexed _idempotencyKey, address indexed _asset, address indexed _eulerVault, uint256 _amount, uint256 _shares);
+    event EulerWithdrawn(bytes32 indexed _idempotencyKey, address indexed _asset, address indexed _eulerVault, uint256 _amount, uint256 _withdrawn);
+    event EulerCollateralEnabled(bytes32 indexed _idempotencyKey, address indexed _eulerVault);
+    event EulerCollateralDisabled(bytes32 indexed _idempotencyKey, address indexed _eulerVault);
+    event EulerTreasuryConnectorSet(address indexed _eulerTreasuryConnector);
+
+    // REDEMPTION Events
+    event RedemptionInitiated(address indexed user, address indexed asset, uint256 assetAmount, uint256 usdxAmount);
+    event RedemptionCompleted(address indexed user, address indexed beneficiary, address indexed asset, uint256 assetAmount);
+    event CooldownDurationSet(uint256 duration);
+    event MaxRedeemPerBlockSet(uint256 maxAmount);
+    event RedeemableAssetSet(address indexed asset, bool isRedeemable);
+    event VaultAdded(address indexed vault, address indexed connector, uint256 allocation, string vaultType);
 
     error InsufficientFunds();
     error OperationLimitExceeded(OperationType _operation, uint256 _amount);
@@ -39,26 +51,34 @@ interface ITreasury is IDefaultErrors {
     error UnknownSpender(address _spender);
     error InvalidRecipientWhitelist(address _recipientWhitelist);
     error InvalidSpenderWhitelist(address _spenderWhitelist);
-    error InvalidLidoTreasuryConnector(address _lidoTreasuryConnector);
     error InvalidAaveTreasuryConnector(address _aaveTreasuryConnector);
-    error InvalidDineroTreasuryConnector(address _dineroTreasuryConnector);
+    error InvalidSiloTreasuryConnector(address _siloTreasuryConnector);
+    error InvalidEulerTreasuryConnector(address _eulerTreasuryConnector);
+    
+    // Redemption errors
+    error UnsupportedAsset();
+    error MinimumCollateralAmountNotMet();
+    error ExceedsMaxBlockLimit();
+    error StillInCooldown();
+    error NoPendingRedemptions();
+    error InsufficientLiquidity();
 
     enum OperationType {
-        LidoDeposit,
-        LidoRequestWithdrawals,
-        LidoClaimWithdrawals,
         AaveSupply,
         AaveBorrow,
         AaveWithdraw,
         AaveRepay,
+        SiloDeposit,
+        SiloWithdraw,
+        EulerDeposit,
+        EulerWithdraw,
+        EulerEnableCollateral,
+        EulerDisableCollateral,
         TransferETH,
         TransferERC20,
         IncreaseAllowance,
         DecreaseAllowance,
-        DineroDeposit,
-        DineroInitiateRedemption,
-        DineroInstantRedeem,
-        DineroRedeem
+        InitiateRedemption
     }
 
     function setOperationLimit(
@@ -105,29 +125,7 @@ interface ITreasury is IDefaultErrors {
         uint256 _decreaseAmount
     ) external;
 
-    function lidoDeposit(
-        bytes32 _idempotencyKey,
-        uint256 _amount
-    ) external returns (uint256 wstETHAmount);
-
-    function lidoRequestWithdrawals(
-        bytes32 _idempotencyKey,
-        uint256[] calldata _amounts
-    ) external returns (uint256[] memory requestIds);
-
-    function lidoClaimWithdrawals(
-        bytes32 _idempotencyKey,
-        uint256[] calldata _requestIds
-    ) external;
-
-    function setLidoTreasuryConnector(
-        address _lidoTreasuryConnector
-    ) external;
-
-    function setLidoReferralCode(
-        address _lidoReferralCode
-    ) external;
-
+    // AAVE Functions
     function aaveSupply(
         bytes32 _idempotencyKey,
         address _token,
@@ -180,23 +178,72 @@ interface ITreasury is IDefaultErrors {
         uint16 _aaveReferralCode
     ) external;
 
-    function dineroDeposit(
+    // SILO Functions
+    function siloDeposit(
         bytes32 _idempotencyKey,
+        address _asset,
+        address _siloVault,
         uint256 _amount
-    ) external returns (uint256 pxETHPostFeeAmount, uint256 feeAmount, uint256 apxETHAmount);
+    ) external returns (uint256 shares);
 
-    function dineroInitiateRedemption(
+    function siloWithdraw(
         bytes32 _idempotencyKey,
-        uint256 _apxETHAmount
-    ) external returns (uint256 pxETHPostFeeAmount, uint256 feeAmount);
+        address _asset,
+        address _siloVault,
+        uint256 _amount
+    ) external returns (uint256 withdrawn);
 
-    function dineroInstantRedeemWithApxEth(
-        bytes32 _idempotencyKey,
-        uint256 _apxETHAmount
-    ) external returns (uint256 pxETHPostFeeAmount, uint256 feeAmount);
-
-    function dineroRedeem(
-        bytes32 _idempotencyKey,
-        uint256[] calldata _upxETHTokenIds
+    function setSiloTreasuryConnector(
+        address _siloTreasuryConnector
     ) external;
+
+    // EULER Functions
+    function eulerDeposit(
+        bytes32 _idempotencyKey,
+        address _asset,
+        address _eulerVault,
+        uint256 _amount
+    ) external returns (uint256 shares);
+
+    function eulerWithdraw(
+        bytes32 _idempotencyKey,
+        address _asset,
+        address _eulerVault,
+        uint256 _amount
+    ) external returns (uint256 withdrawn);
+
+    function eulerEnableCollateral(
+        bytes32 _idempotencyKey,
+        address _eulerVault
+    ) external;
+
+    function eulerDisableCollateral(
+        bytes32 _idempotencyKey,
+        address _eulerVault
+    ) external;
+
+    function setEulerTreasuryConnector(
+        address _eulerTreasuryConnector
+    ) external;
+
+    // REDEMPTION Functions
+    function initiateRedemption(
+        uint256 _usdxAmount,
+        uint256 _minUsdcAmount
+    ) external returns (uint256 usdxAmount, uint256 usdcAmount);
+
+    function completeRedemption(
+        address _beneficiary
+    ) external returns (uint256 usdcAmount);
+
+    function computeRedemption(
+        address _asset,
+        uint256 _usdxAmount
+    ) external view returns (uint256 usdcAmount);
+
+    function setCooldownDuration(uint256 _cooldownDuration) external;
+
+    function setMaxRedeemPerBlock(uint256 _maxRedeemPerBlock) external;
+
+    function setRedeemableAsset(address _asset, bool _isRedeemable) external;
 }

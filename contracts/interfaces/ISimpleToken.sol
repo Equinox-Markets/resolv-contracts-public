@@ -12,4 +12,8 @@ interface ISimpleToken {
     function burn(address _account, uint256 _amount) external;
 
     function burn(bytes32 _idempotencyKey, address _account, uint256 _amount) external;
+
+    function burn(uint256 _amount) external;
+
+    function burnFrom(address _account, uint256 _amount) external;
 }

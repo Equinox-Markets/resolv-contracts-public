@@ -4,36 +4,68 @@ pragma solidity ^0.8.25;
 import {AccessControlDefaultAdminRulesUpgradeable} from "@openzeppelin/contracts-upgradeable/access/extensions/AccessControlDefaultAdminRulesUpgradeable.sol";
 import {Address} from "@openzeppelin/contracts/utils/Address.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
-import {ILidoTreasuryConnector} from "./interfaces/ILidoTreasuryConnector.sol";
+import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {IAaveTreasuryConnector} from "./interfaces/IAaveTreasuryConnector.sol";
+import {ISiloTreasuryConnector} from "./interfaces/ISiloTreasuryConnector.sol";
+import {IEulerTreasuryConnector} from "./interfaces/IEulerTreasuryConnector.sol";
 import {ITreasury} from "./interfaces/ITreasury.sol";
 import {IAddressesWhitelist} from "./interfaces/IAddressesWhitelist.sol";
-import {IDineroTreasuryConnector} from "./interfaces/IDineroTreasuryConnector.sol";
+import {ISimpleToken} from "./interfaces/ISimpleToken.sol";
+import {IChainlinkOracle} from "./interfaces/oracles/IChainlinkOracle.sol";
+import {IEscrow} from "./interfaces/IEscrow.sol";
 
-contract Treasury is ITreasury, AccessControlDefaultAdminRulesUpgradeable, PausableUpgradeable {
+contract Treasury is ITreasury, AccessControlDefaultAdminRulesUpgradeable, PausableUpgradeable, ReentrancyGuardUpgradeable {
 
     using Address for address payable;
     using SafeERC20 for IERC20;
+    using Math for uint256;
 
     bytes32 public constant SERVICE_ROLE = keccak256("SERVICE_ROLE");
-    IERC20 public constant WST_ETH = IERC20(0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0);
-    IERC20 public constant APX_ETH = IERC20(0x9Ba021B0a9b958B5E75cE9f6dff97C7eE52cb3E6);
+    bytes32 public constant REDEMPTION_ROLE = keccak256("REDEMPTION_ROLE");
 
-    address public lidoReferralCode;
-    ILidoTreasuryConnector public lidoTreasuryConnector;
+    uint256 public constant USDC_DECIMALS = 6;
+    uint256 public constant USDX_DECIMALS = 18;
+    uint256 public constant PRICE_SCALE = 1e18;
+    uint256 public constant HEARTBEAT_INTERVAL = 86400; // 24 hours
+
+    address public immutable USDX_ADDRESS;
+    address public immutable USDC_ADDRESS;
 
     uint16 public aaveReferralCode;
     IAaveTreasuryConnector public aaveTreasuryConnector;
-
-    IDineroTreasuryConnector public dineroTreasuryConnector;
+    ISiloTreasuryConnector public siloTreasuryConnector;
+    IEulerTreasuryConnector public eulerTreasuryConnector;
+    IChainlinkOracle public chainlinkOracle;
+    IEscrow public escrow;
 
     IAddressesWhitelist public recipientWhitelist;
     bool public isRecipientWhitelistEnabled;
-
     IAddressesWhitelist public spenderWhitelist;
     bool public isSpenderWhitelistEnabled;
+
+    // Redemption state
+    mapping(address user => mapping(address asset => uint256 amount)) public pendingRedemptions;
+    mapping(address user => mapping(address asset => uint256 timestamp)) public userCooldowns;
+    mapping(uint256 blockNumber => uint256 amount) public redeemedPerBlock;
+    mapping(address asset => bool isRedeemable) public redeemableAssets;
+    
+    uint256 public cooldownDuration;
+    uint256 public maxRedeemPerBlock;
+
+    // Vault configurations for withdrawal prioritization
+    struct VaultConfig {
+        address vault;
+        address connector;
+        uint256 allocation;
+        bool isActive;
+    }
+    
+    VaultConfig[] public siloVaults;
+    VaultConfig[] public eulerVaults;
 
     mapping(OperationType operation => mapping(bytes32 idempotencyKey => bool exist)) public operationRegistry;
     mapping(OperationType operation => uint256 limit) public operationLimits;
@@ -61,45 +93,60 @@ contract Treasury is ITreasury, AccessControlDefaultAdminRulesUpgradeable, Pausa
     }
 
     /// @custom:oz-upgrades-unsafe-allow constructor
-    constructor() {
+    constructor(address _usdxAddress, address _usdcAddress) {
+        USDX_ADDRESS = _assertNonZero(_usdxAddress);
+        USDC_ADDRESS = _assertNonZero(_usdcAddress);
         _disableInitializers();
     }
 
     function initialize(
-        address _lidoTreasuryConnector,
         address _aaveTreasuryConnector,
-        address _dineroTreasuryConnector,
+        address _siloTreasuryConnector,
+        address _eulerTreasuryConnector,
         address _recipientWhitelist,
-        address _spenderWhitelist
+        address _spenderWhitelist,
+        address _chainlinkOracle,
+        address _escrow,
+        uint256 _cooldownDuration,
+        uint256 _maxRedeemPerBlock
     ) public initializer {
         __AccessControlDefaultAdminRules_init(1 days, msg.sender);
         __Pausable_init();
+        __ReentrancyGuard_init();
 
-        operationLimits[OperationType.LidoDeposit] = type(uint256).max;
-        operationLimits[OperationType.LidoRequestWithdrawals] = type(uint256).max;
+        // Initialize operation limits
         operationLimits[OperationType.AaveSupply] = type(uint256).max;
         operationLimits[OperationType.AaveBorrow] = type(uint256).max;
         operationLimits[OperationType.AaveWithdraw] = type(uint256).max;
         operationLimits[OperationType.AaveRepay] = type(uint256).max;
+        operationLimits[OperationType.SiloDeposit] = type(uint256).max;
+        operationLimits[OperationType.SiloWithdraw] = type(uint256).max;
+        operationLimits[OperationType.EulerDeposit] = type(uint256).max;
+        operationLimits[OperationType.EulerWithdraw] = type(uint256).max;
+        operationLimits[OperationType.EulerEnableCollateral] = type(uint256).max;
+        operationLimits[OperationType.EulerDisableCollateral] = type(uint256).max;
         operationLimits[OperationType.TransferETH] = type(uint256).max;
         operationLimits[OperationType.TransferERC20] = type(uint256).max;
         operationLimits[OperationType.IncreaseAllowance] = type(uint256).max;
         operationLimits[OperationType.DecreaseAllowance] = type(uint256).max;
-        operationLimits[OperationType.DineroDeposit] = type(uint256).max;
-        operationLimits[OperationType.DineroInitiateRedemption] = type(uint256).max;
-        operationLimits[OperationType.DineroInstantRedeem] = type(uint256).max;
+        operationLimits[OperationType.InitiateRedemption] = type(uint256).max;
 
-        _assertNonZero(_lidoTreasuryConnector);
-        lidoTreasuryConnector = ILidoTreasuryConnector(_lidoTreasuryConnector);
-        lidoReferralCode = address(0);
-
+        // Initialize connectors
         _assertNonZero(_aaveTreasuryConnector);
         aaveTreasuryConnector = IAaveTreasuryConnector(_aaveTreasuryConnector);
         aaveReferralCode = 0;
 
-        _assertNonZero(_dineroTreasuryConnector);
-        dineroTreasuryConnector = IDineroTreasuryConnector(_dineroTreasuryConnector);
+        _assertNonZero(_siloTreasuryConnector);
+        siloTreasuryConnector = ISiloTreasuryConnector(_siloTreasuryConnector);
 
+        _assertNonZero(_eulerTreasuryConnector);
+        eulerTreasuryConnector = IEulerTreasuryConnector(_eulerTreasuryConnector);
+
+        // Initialize oracle and escrow
+        chainlinkOracle = IChainlinkOracle(_assertNonZero(_chainlinkOracle));
+        escrow = IEscrow(_assertNonZero(_escrow));
+
+        // Initialize whitelists
         _assertNonZero(_recipientWhitelist);
         recipientWhitelist = IAddressesWhitelist(_recipientWhitelist);
         isRecipientWhitelistEnabled = true;
@@ -107,11 +154,210 @@ contract Treasury is ITreasury, AccessControlDefaultAdminRulesUpgradeable, Pausa
         _assertNonZero(_spenderWhitelist);
         spenderWhitelist = IAddressesWhitelist(_spenderWhitelist);
         isSpenderWhitelistEnabled = true;
+
+        // Initialize redemption parameters
+        cooldownDuration = _cooldownDuration;
+        maxRedeemPerBlock = _maxRedeemPerBlock;
+        
+        // USDC is redeemable by default
+        redeemableAssets[USDC_ADDRESS] = true;
     }
 
     receive() external payable {
         emit Received(msg.sender, msg.value);
     }
+
+    // =============================================================================
+    // REDEMPTION SYSTEM
+    // =============================================================================
+
+    /**
+     * @dev Initiates redemption of USDX for USDC with cooldown period
+     * @param _usdxAmount Amount of USDX to redeem
+     * @param _minUsdcAmount Minimum USDC amount expected
+     * @return usdxAmount The USDX amount burned
+     * @return usdcAmount The USDC amount to be received after cooldown
+     */
+    function initiateRedemption(
+        uint256 _usdxAmount,
+        uint256 _minUsdcAmount
+    ) external 
+        whenNotPaused 
+        nonReentrant 
+        returns (uint256 usdxAmount, uint256 usdcAmount) 
+    {
+        if (!redeemableAssets[USDC_ADDRESS]) revert UnsupportedAsset();
+        if (_usdxAmount == 0) revert InvalidAmount(_usdxAmount);
+
+        // Calculate USDC amount using price adjustment
+        usdcAmount = computeRedemption(USDC_ADDRESS, _usdxAmount);
+        if (usdcAmount < _minUsdcAmount) revert MinimumCollateralAmountNotMet();
+
+        // Track pending redemption and start cooldown
+        pendingRedemptions[msg.sender][USDC_ADDRESS] += usdcAmount;
+        userCooldowns[msg.sender][USDC_ADDRESS] = block.timestamp;
+        redeemedPerBlock[block.number] += _usdxAmount;
+
+        // Check block limits
+        if (redeemedPerBlock[block.number] > maxRedeemPerBlock) {
+            revert ExceedsMaxBlockLimit();
+        }
+
+        // Burn USDX immediately
+        ISimpleToken(USDX_ADDRESS).burn(msg.sender, _usdxAmount);
+
+        // Ensure enough USDC is available
+        uint256 availableUsdc = IERC20(USDC_ADDRESS).balanceOf(address(this));
+        if (availableUsdc < usdcAmount) {
+            uint256 toWithdraw = usdcAmount - availableUsdc;
+            _withdrawFromProtocols(toWithdraw);
+        }
+
+        // Move USDC to escrow during cooldown
+        IERC20(USDC_ADDRESS).safeTransfer(address(escrow), usdcAmount);
+
+        emit RedemptionInitiated(msg.sender, USDC_ADDRESS, usdcAmount, _usdxAmount);
+
+        return (_usdxAmount, usdcAmount);
+    }
+
+    /**
+     * @dev Completes redemption after cooldown period
+     * @param _beneficiary Address to receive the USDC
+     * @return usdcAmount Amount of USDC transferred
+     */
+    function completeRedemption(
+        address _beneficiary
+    ) external 
+        whenNotPaused 
+        nonReentrant 
+        returns (uint256 usdcAmount) 
+    {
+        // Check cooldown has passed
+        if (userCooldowns[msg.sender][USDC_ADDRESS] + cooldownDuration > block.timestamp) {
+            revert StillInCooldown();
+        }
+
+        // Get pending redemption amount
+        usdcAmount = pendingRedemptions[msg.sender][USDC_ADDRESS];
+        if (usdcAmount == 0) revert NoPendingRedemptions();
+
+        // Clear redemption state
+        userCooldowns[msg.sender][USDC_ADDRESS] = 0;
+        pendingRedemptions[msg.sender][USDC_ADDRESS] = 0;
+
+        // Transfer USDC from escrow to beneficiary
+        escrow.withdraw(_beneficiary, USDC_ADDRESS, usdcAmount);
+
+        emit RedemptionCompleted(msg.sender, _beneficiary, USDC_ADDRESS, usdcAmount);
+
+        return usdcAmount;
+    }
+
+    /**
+     * @dev Computes USDC amount for USDX redemption with price adjustment
+     * @param _asset The asset to redeem (USDC)
+     * @param _usdxAmount Amount of USDX to redeem
+     * @return usdcAmount Amount of USDC to receive
+     */
+    function computeRedemption(
+        address _asset,
+        uint256 _usdxAmount
+    ) public view returns (uint256 usdcAmount) {
+        if (_asset != USDC_ADDRESS) revert UnsupportedAsset();
+
+        try chainlinkOracle.getLatestRoundData(USDC_ADDRESS) returns (
+            uint80, int256 price, uint256, uint256 updatedAt, uint80
+        ) {
+            // Check if price data is recent
+            if (block.timestamp - updatedAt > HEARTBEAT_INTERVAL) {
+                // Use 1:1 conversion if stale data
+                return _convertUsdxToUsdc(_usdxAmount);
+            }
+
+            uint8 priceDecimals = chainlinkOracle.priceDecimals(USDC_ADDRESS);
+            uint256 priceScale = 10 ** priceDecimals;
+
+            // If USDC is trading above $1, give less USDC to maintain collateralization
+            if (uint256(price) > priceScale) {
+                uint256 adjustedUsdxAmount = _usdxAmount.mulDiv(priceScale, uint256(price));
+                return _convertUsdxToUsdc(adjustedUsdxAmount);
+            } else {
+                // 1:1 conversion (1 USDX = 1 USDC)
+                return _convertUsdxToUsdc(_usdxAmount);
+            }
+        } catch {
+            // Fallback to 1:1 conversion if oracle fails
+            return _convertUsdxToUsdc(_usdxAmount);
+        }
+    }
+
+    /**
+     * @dev Withdraws USDC from lending protocols to fulfill redemption
+     * @param _amount Amount of USDC needed
+     */
+    function _withdrawFromProtocols(uint256 _amount) internal {
+        uint256 remaining = _amount;
+
+        // Try withdrawing from Silo vaults first (60% allocation)
+        for (uint256 i = 0; i < siloVaults.length && remaining > 0; i++) {
+            if (!siloVaults[i].isActive) continue;
+            
+            uint256 vaultBalance = siloTreasuryConnector.getVaultBalance(siloVaults[i].vault);
+            if (vaultBalance == 0) continue;
+
+            uint256 maxWithdraw = siloTreasuryConnector.previewWithdraw(siloVaults[i].vault, remaining);
+            
+            if (maxWithdraw > 0) {
+                uint256 toWithdraw = remaining > maxWithdraw ? maxWithdraw : remaining;
+                siloTreasuryConnector.withdraw(USDC_ADDRESS, siloVaults[i].vault, toWithdraw);
+                remaining -= toWithdraw;
+            }
+        }
+
+        // Then try Euler vaults (40% allocation)
+        for (uint256 i = 0; i < eulerVaults.length && remaining > 0; i++) {
+            if (!eulerVaults[i].isActive) continue;
+            
+            uint256 vaultBalance = eulerTreasuryConnector.getVaultBalance(eulerVaults[i].vault);
+            if (vaultBalance == 0) continue;
+
+            uint256 maxWithdraw = eulerTreasuryConnector.previewWithdraw(eulerVaults[i].vault, remaining);
+            
+            if (maxWithdraw > 0) {
+                uint256 toWithdraw = remaining > maxWithdraw ? maxWithdraw : remaining;
+                eulerTreasuryConnector.withdraw(USDC_ADDRESS, eulerVaults[i].vault, toWithdraw);
+                remaining -= toWithdraw;
+            }
+        }
+
+        // Finally try Aave if still need more
+        if (remaining > 0) {
+            uint256 aaveBalance = aaveTreasuryConnector.getATokenBalance(USDC_ADDRESS);
+            if (aaveBalance > 0) {
+                uint256 toWithdraw = remaining > aaveBalance ? aaveBalance : remaining;
+                aaveTreasuryConnector.withdraw(USDC_ADDRESS, toWithdraw);
+                remaining -= toWithdraw;
+            }
+        }
+
+        if (remaining > 0) {
+            revert InsufficientLiquidity();
+        }
+    }
+
+    /**
+     * @dev Converts USDX amount to USDC amount accounting for decimals
+     * @param _usdxAmount Amount in USDX (18 decimals)
+     * @return usdcAmount Amount in USDC (6 decimals)
+     */
+    function _convertUsdxToUsdc(uint256 _usdxAmount) internal pure returns (uint256 usdcAmount) {
+        return _usdxAmount / (10 ** (USDX_DECIMALS - USDC_DECIMALS));
+    }
+
+    // =============================================================================
+    // BASIC TREASURY OPERATIONS
+    // =============================================================================
 
     function setOperationLimit(
         OperationType _operation,
@@ -231,69 +477,9 @@ contract Treasury is ITreasury, AccessControlDefaultAdminRulesUpgradeable, Pausa
         emit DecreasedAllowance(_idempotencyKey, address(_token), _spender, _decreaseAmount);
     }
 
-    function lidoDeposit(
-        bytes32 _idempotencyKey,
-        uint256 _amount
-    ) external onlyRole(SERVICE_ROLE) idempotent(OperationType.LidoDeposit, _idempotencyKey) whenNotPaused returns (uint256 wstETHAmount) {
-        _assertNonZero(_amount);
-        _assertSufficientFunds(_amount);
-        _assertOperationLimit(OperationType.LidoDeposit, _amount);
-
-        // slither-disable-next-line arbitrary-send-eth
-        wstETHAmount = lidoTreasuryConnector.deposit{value: _amount}(lidoReferralCode);
-
-        emit LidoDeposited(_idempotencyKey, _amount, wstETHAmount);
-
-        return wstETHAmount;
-    }
-
-    function lidoRequestWithdrawals(
-        bytes32 _idempotencyKey,
-        uint256[] calldata _amounts
-    ) external onlyRole(SERVICE_ROLE) idempotent(OperationType.LidoRequestWithdrawals, _idempotencyKey) whenNotPaused returns (uint256[] memory requestIds) {
-        uint256 totalAmount;
-        for (uint256 i = 0; i < _amounts.length; i++) {
-            _assertNonZero(_amounts[i]);
-            totalAmount += _amounts[i];
-        }
-
-        _assertNonZero(totalAmount);
-        _assertOperationLimit(OperationType.LidoRequestWithdrawals, totalAmount);
-
-        WST_ETH.safeIncreaseAllowance(address(lidoTreasuryConnector), totalAmount);
-
-        requestIds = lidoTreasuryConnector.requestWithdrawals(_amounts, totalAmount);
-
-        emit LidoWithdrawalsRequested(_idempotencyKey, requestIds, _amounts, totalAmount);
-    }
-
-    function lidoClaimWithdrawals(
-        bytes32 _idempotencyKey,
-        uint256[] calldata _requestIds
-    ) external onlyRole(SERVICE_ROLE) idempotent(OperationType.LidoClaimWithdrawals, _idempotencyKey) whenNotPaused {
-        lidoTreasuryConnector.claimWithdrawals(_requestIds);
-
-        emit LidoWithdrawalsClaimed(_idempotencyKey, _requestIds);
-    }
-
-    function setLidoTreasuryConnector(
-        address _lidoTreasuryConnector
-    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        _assertNonZero(_lidoTreasuryConnector);
-        if (_lidoTreasuryConnector.code.length == 0) revert InvalidLidoTreasuryConnector(_lidoTreasuryConnector);
-
-        lidoTreasuryConnector = ILidoTreasuryConnector(_lidoTreasuryConnector);
-
-        emit LidoTreasuryConnectorSet(_lidoTreasuryConnector);
-    }
-
-    function setLidoReferralCode(
-        address _lidoReferralCode
-    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        lidoReferralCode = _lidoReferralCode;
-
-        emit LidoReferralCodeSet(_lidoReferralCode);
-    }
+    // =============================================================================
+    // AAVE OPERATIONS
+    // =============================================================================
 
     function aaveSupply(
         bytes32 _idempotencyKey,
@@ -346,7 +532,7 @@ contract Treasury is ITreasury, AccessControlDefaultAdminRulesUpgradeable, Pausa
     }
 
     /**
-    * @param _repayAmount Use `type(uint256).max` to withdraw the maximum available amount.
+    * @param _repayAmount Use `type(uint256).max` to repay the maximum available amount.
     */
     function aaveRepay(
         bytes32 _idempotencyKey,
@@ -441,76 +627,242 @@ contract Treasury is ITreasury, AccessControlDefaultAdminRulesUpgradeable, Pausa
         emit AaveReferralCodeSet(_aaveReferralCode);
     }
 
-    function dineroDeposit(
+    // =============================================================================
+    // SILO OPERATIONS
+    // =============================================================================
+
+    function siloDeposit(
         bytes32 _idempotencyKey,
+        address _asset,
+        address _siloVault,
         uint256 _amount
-    ) external onlyRole(SERVICE_ROLE) idempotent(OperationType.DineroDeposit, _idempotencyKey) whenNotPaused
-    returns (uint256 pxETHPostFeeAmount, uint256 feeAmount, uint256 apxETHAmount) {
+    ) external onlyRole(SERVICE_ROLE) idempotent(OperationType.SiloDeposit, _idempotencyKey) whenNotPaused returns (uint256 shares) {
+        _assertNonZero(_asset);
+        _assertNonZero(_siloVault);
         _assertNonZero(_amount);
-        _assertSufficientFunds(_amount);
-        _assertOperationLimit(OperationType.DineroDeposit, _amount);
+        _assertOperationLimit(OperationType.SiloDeposit, _amount);
 
-        // slither-disable-next-line arbitrary-send-eth
-        (pxETHPostFeeAmount, feeAmount, apxETHAmount) = dineroTreasuryConnector.deposit{value: _amount}();
+        IERC20(_asset).safeIncreaseAllowance(address(siloTreasuryConnector), _amount);
+        shares = siloTreasuryConnector.deposit(_asset, _siloVault, _amount);
 
-        emit DineroDeposited(_idempotencyKey, _amount, pxETHPostFeeAmount, feeAmount, apxETHAmount);
+        emit SiloDeposited(_idempotencyKey, _asset, _siloVault, _amount, shares);
 
-        return (pxETHPostFeeAmount, feeAmount, apxETHAmount);
+        return shares;
     }
 
-    function dineroInitiateRedemption(
+    function siloWithdraw(
         bytes32 _idempotencyKey,
-        uint256 _apxETHAmount
-    ) external onlyRole(SERVICE_ROLE) idempotent(OperationType.DineroInitiateRedemption, _idempotencyKey) whenNotPaused
-    returns (uint256 pxETHPostFeeAmount, uint256 feeAmount) {
-        _assertNonZero(_apxETHAmount);
-        _assertOperationLimit(OperationType.DineroInitiateRedemption, _apxETHAmount);
+        address _asset,
+        address _siloVault,
+        uint256 _amount
+    ) external onlyRole(SERVICE_ROLE) idempotent(OperationType.SiloWithdraw, _idempotencyKey) whenNotPaused returns (uint256 withdrawn) {
+        _assertNonZero(_asset);
+        _assertNonZero(_siloVault);
+        _assertNonZero(_amount);
+        _assertOperationLimit(OperationType.SiloWithdraw, _amount);
 
-        APX_ETH.safeIncreaseAllowance(address(dineroTreasuryConnector), _apxETHAmount);
+        withdrawn = siloTreasuryConnector.withdraw(_asset, _siloVault, _amount);
 
-        (pxETHPostFeeAmount, feeAmount) = dineroTreasuryConnector.initiateRedemption(_apxETHAmount);
+        emit SiloWithdrawn(_idempotencyKey, _asset, _siloVault, _amount, withdrawn);
 
-        emit DineroInitiatedRedemption(_idempotencyKey, _apxETHAmount, pxETHPostFeeAmount, feeAmount);
-
-        return (pxETHPostFeeAmount, feeAmount);
+        return withdrawn;
     }
 
-    function dineroInstantRedeemWithApxEth(
-        bytes32 _idempotencyKey,
-        uint256 _apxETHAmount
-    ) external onlyRole(SERVICE_ROLE) idempotent(OperationType.DineroInstantRedeem, _idempotencyKey) whenNotPaused
-    returns (uint256 pxETHPostFeeAmount, uint256 feeAmount) {
-        _assertNonZero(_apxETHAmount);
-        _assertOperationLimit(OperationType.DineroInstantRedeem, _apxETHAmount);
-
-        APX_ETH.safeIncreaseAllowance(address(dineroTreasuryConnector), _apxETHAmount);
-
-        (pxETHPostFeeAmount, feeAmount) = dineroTreasuryConnector.instantRedeemWithApxEth(_apxETHAmount);
-
-        emit DineroInstantRedeemed(_idempotencyKey, _apxETHAmount, pxETHPostFeeAmount, feeAmount);
-
-        return (pxETHPostFeeAmount, feeAmount);
-    }
-
-    function dineroRedeem(
-        bytes32 _idempotencyKey,
-        uint256[] calldata _upxETHTokenIds
-    ) external onlyRole(SERVICE_ROLE) idempotent(OperationType.DineroRedeem, _idempotencyKey) whenNotPaused {
-        dineroTreasuryConnector.redeem(_upxETHTokenIds);
-
-        emit DineroRedeemed(_idempotencyKey, _upxETHTokenIds);
-    }
-
-    function setDineroTreasuryConnector(
-        address _dineroTreasuryConnector
+    function setSiloTreasuryConnector(
+        address _siloTreasuryConnector
     ) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        _assertNonZero(_dineroTreasuryConnector);
-        if (_dineroTreasuryConnector.code.length == 0) revert InvalidDineroTreasuryConnector(_dineroTreasuryConnector);
+        _assertNonZero(_siloTreasuryConnector);
+        if (_siloTreasuryConnector.code.length == 0) revert InvalidSiloTreasuryConnector(_siloTreasuryConnector);
 
-        dineroTreasuryConnector = IDineroTreasuryConnector(_dineroTreasuryConnector);
+        siloTreasuryConnector = ISiloTreasuryConnector(_siloTreasuryConnector);
 
-        emit DineroTreasuryConnectorSet(_dineroTreasuryConnector);
+        emit SiloTreasuryConnectorSet(_siloTreasuryConnector);
     }
+
+    // =============================================================================
+    // EULER OPERATIONS
+    // =============================================================================
+
+    function eulerDeposit(
+        bytes32 _idempotencyKey,
+        address _asset,
+        address _eulerVault,
+        uint256 _amount
+    ) external onlyRole(SERVICE_ROLE) idempotent(OperationType.EulerDeposit, _idempotencyKey) whenNotPaused returns (uint256 shares) {
+        _assertNonZero(_asset);
+        _assertNonZero(_eulerVault);
+        _assertNonZero(_amount);
+        _assertOperationLimit(OperationType.EulerDeposit, _amount);
+
+        IERC20(_asset).safeIncreaseAllowance(address(eulerTreasuryConnector), _amount);
+        shares = eulerTreasuryConnector.deposit(_asset, _eulerVault, _amount);
+
+        emit EulerDeposited(_idempotencyKey, _asset, _eulerVault, _amount, shares);
+
+        return shares;
+    }
+
+    function eulerWithdraw(
+        bytes32 _idempotencyKey,
+        address _asset,
+        address _eulerVault,
+        uint256 _amount
+    ) external onlyRole(SERVICE_ROLE) idempotent(OperationType.EulerWithdraw, _idempotencyKey) whenNotPaused returns (uint256 withdrawn) {
+        _assertNonZero(_asset);
+        _assertNonZero(_eulerVault);
+        _assertNonZero(_amount);
+        _assertOperationLimit(OperationType.EulerWithdraw, _amount);
+
+        withdrawn = eulerTreasuryConnector.withdraw(_asset, _eulerVault, _amount);
+
+        emit EulerWithdrawn(_idempotencyKey, _asset, _eulerVault, _amount, withdrawn);
+
+        return withdrawn;
+    }
+
+    function eulerEnableCollateral(
+        bytes32 _idempotencyKey,
+        address _eulerVault
+    ) external onlyRole(SERVICE_ROLE) idempotent(OperationType.EulerEnableCollateral, _idempotencyKey) whenNotPaused {
+        _assertNonZero(_eulerVault);
+
+        eulerTreasuryConnector.enableCollateral(_eulerVault);
+
+        emit EulerCollateralEnabled(_idempotencyKey, _eulerVault);
+    }
+
+    function eulerDisableCollateral(
+        bytes32 _idempotencyKey,
+        address _eulerVault
+    ) external onlyRole(SERVICE_ROLE) idempotent(OperationType.EulerDisableCollateral, _idempotencyKey) whenNotPaused {
+        _assertNonZero(_eulerVault);
+
+        eulerTreasuryConnector.disableCollateral(_eulerVault);
+
+        emit EulerCollateralDisabled(_idempotencyKey, _eulerVault);
+    }
+
+    function setEulerTreasuryConnector(
+        address _eulerTreasuryConnector
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _assertNonZero(_eulerTreasuryConnector);
+        if (_eulerTreasuryConnector.code.length == 0) revert InvalidEulerTreasuryConnector(_eulerTreasuryConnector);
+
+        eulerTreasuryConnector = IEulerTreasuryConnector(_eulerTreasuryConnector);
+
+        emit EulerTreasuryConnectorSet(_eulerTreasuryConnector);
+    }
+
+    // =============================================================================
+    // REDEMPTION CONFIGURATION
+    // =============================================================================
+
+    function setCooldownDuration(uint256 _cooldownDuration) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        cooldownDuration = _cooldownDuration;
+        emit CooldownDurationSet(_cooldownDuration);
+    }
+
+    function setMaxRedeemPerBlock(uint256 _maxRedeemPerBlock) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        maxRedeemPerBlock = _maxRedeemPerBlock;
+        emit MaxRedeemPerBlockSet(_maxRedeemPerBlock);
+    }
+
+    function setRedeemableAsset(address _asset, bool _isRedeemable) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        redeemableAssets[_asset] = _isRedeemable;
+        emit RedeemableAssetSet(_asset, _isRedeemable);
+    }
+
+    function addSiloVault(
+        address _vault,
+        address _connector,
+        uint256 _allocation
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        siloVaults.push(VaultConfig({
+            vault: _vault,
+            connector: _connector,
+            allocation: _allocation,
+            isActive: true
+        }));
+        emit VaultAdded(_vault, _connector, _allocation, "Silo");
+    }
+
+    function addEulerVault(
+        address _vault,
+        address _connector,
+        uint256 _allocation
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        eulerVaults.push(VaultConfig({
+            vault: _vault,
+            connector: _connector,
+            allocation: _allocation,
+            isActive: true
+        }));
+        emit VaultAdded(_vault, _connector, _allocation, "Euler");
+    }
+
+    function setSiloVaultStatus(uint256 _index, bool _isActive) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (_index >= siloVaults.length) revert InvalidVaultIndex();
+        siloVaults[_index].isActive = _isActive;
+        emit VaultStatusSet(siloVaults[_index].vault, _isActive);
+    }
+
+    function setEulerVaultStatus(uint256 _index, bool _isActive) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (_index >= eulerVaults.length) revert InvalidVaultIndex();
+        eulerVaults[_index].isActive = _isActive;
+        emit VaultStatusSet(eulerVaults[_index].vault, _isActive);
+    }
+
+    function setChainlinkOracle(address _chainlinkOracle) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        chainlinkOracle = IChainlinkOracle(_assertNonZero(_chainlinkOracle));
+        emit ChainlinkOracleSet(_chainlinkOracle);
+    }
+
+    function setEscrow(address _escrow) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        escrow = IEscrow(_assertNonZero(_escrow));
+        emit EscrowSet(_escrow);
+    }
+
+    // =============================================================================
+    // VIEW FUNCTIONS
+    // =============================================================================
+
+    function getSiloVaultsCount() external view returns (uint256) {
+        return siloVaults.length;
+    }
+
+    function getEulerVaultsCount() external view returns (uint256) {
+        return eulerVaults.length;
+    }
+
+    function getSiloVault(uint256 _index) external view returns (VaultConfig memory) {
+        if (_index >= siloVaults.length) revert InvalidVaultIndex();
+        return siloVaults[_index];
+    }
+
+    function getEulerVault(uint256 _index) external view returns (VaultConfig memory) {
+        if (_index >= eulerVaults.length) revert InvalidVaultIndex();
+        return eulerVaults[_index];
+    }
+
+    function getUserRedemptionInfo(address _user) external view returns (
+        uint256 pendingAmount,
+        uint256 cooldownStart,
+        uint256 cooldownEnd,
+        bool canComplete
+    ) {
+        pendingAmount = pendingRedemptions[_user][USDC_ADDRESS];
+        cooldownStart = userCooldowns[_user][USDC_ADDRESS];
+        cooldownEnd = cooldownStart + cooldownDuration;
+        canComplete = pendingAmount > 0 && block.timestamp >= cooldownEnd;
+    }
+
+    function getBlockRedemptionInfo(uint256 _blockNumber) external view returns (uint256 redeemedAmount) {
+        return redeemedPerBlock[_blockNumber];
+    }
+
+    // =============================================================================
+    // INTERNAL UTILITY FUNCTIONS
+    // =============================================================================
 
     function _assertOperationLimit(OperationType _operation, uint256 _amount) internal view {
         if (_amount > operationLimits[_operation]) revert OperationLimitExceeded(_operation, _amount);
@@ -520,12 +872,12 @@ contract Treasury is ITreasury, AccessControlDefaultAdminRulesUpgradeable, Pausa
         if (_amount > address(this).balance) revert InsufficientFunds();
     }
 
-    function _assertNonZero(address _address) internal pure {
+    function _assertNonZero(address _address) internal pure returns (address nonZeroAddress) {
         if (_address == address(0)) revert ZeroAddress();
+        return _address;
     }
 
     function _assertNonZero(uint256 _amount) internal pure {
         if (_amount == 0) revert InvalidAmount(_amount);
     }
-
 }
